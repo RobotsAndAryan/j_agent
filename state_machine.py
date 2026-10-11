@@ -1,3 +1,4 @@
+import argparse
 import asyncio
 import json
 import operator
@@ -262,6 +263,41 @@ def _url_key(url: str) -> str:
 _INTERN_TERMS = ("intern", "placement", "spring week", "insight week", "graduate", "junior", "student", "trainee")
 _AUTH_WALLED  = ("linkedin.com", "glassdoor.com")  # jobspy already fetches full descriptions for these
 
+# Phrases that indicate a job is no longer accepting applications
+_CLOSED_PHRASES = (
+    "no longer accepting", "position filled", "job has been filled",
+    "this job is no longer", "applications are closed", "vacancy closed",
+    "this vacancy is now closed", "this role is no longer available",
+    "role has been filled", "position has been closed", "job expired",
+    "this opportunity has closed", "application window has closed",
+    "this job listing has expired", "no longer available",
+)
+
+def _check_url_open(url: str) -> tuple[bool, str]:
+    """Return (is_open, reason). Skips auth-walled and Trackr SPA URLs.
+    Does a HEAD check for 404, then a light GET for closed-phrase scan."""
+    if not url:
+        return True, ""
+    # Can't meaningfully check these without auth or JS rendering
+    if any(d in url for d in (*_AUTH_WALLED, "app.the-trackr.com")):
+        return True, ""
+    try:
+        head = requests.head(url, headers=HEADERS, timeout=5, allow_redirects=True)
+        if head.status_code == 404:
+            return False, "404 not found"
+        # GET to scan for closed phrases (only if HEAD succeeded)
+        if head.status_code < 400:
+            resp = requests.get(url, headers=HEADERS, timeout=8)
+            text_lower = resp.text.lower()
+            for phrase in _CLOSED_PHRASES:
+                if phrase in text_lower:
+                    return False, f'page says "{phrase}"'
+    except requests.exceptions.Timeout:
+        return True, "timeout — assumed open"
+    except Exception:
+        return True, "fetch error — assumed open"
+    return True, ""
+
 # ── Trackr API queries (UK early-careers, curated, structured) ───────────────
 # (params dict, program_type label)
 # Summer internships and part-time only — no graduate schemes, placements, or spring weeks
@@ -419,6 +455,8 @@ def _build_trackr_entry(prog: dict, program_type: str) -> dict:
         "job_url":      url or f"https://app.the-trackr.com/uk-engineering/{prog.get('type', '')}",
         "job_desc":     job_desc,
         "program_type": program_type,
+        "closing_date": prog.get("closingDate", ""),
+        "opening_date": prog.get("openingDate", ""),
     }
 
 
@@ -451,7 +489,17 @@ def prefetch_trackr():
                 print("Trackr: session expired — update TRACKR_SESSION_ID in .env")
                 return
             resp.raise_for_status()
+            today = datetime.now()
             for prog in resp.json().get("programmes", []):
+                # Skip roles whose closing date has already passed
+                close_str = prog.get("closingDate", "")
+                if close_str:
+                    try:
+                        close_dt = datetime.fromisoformat(close_str.replace("Z", ""))
+                        if close_dt < today:
+                            continue
+                    except Exception:
+                        pass
                 raw.append(_build_trackr_entry(prog, program_type))
         except Exception as e:
             print(f"Trackr prefetch ({params.get('type', '')}): {e}")
@@ -646,7 +694,13 @@ async def scrape_jobs(state: AppState):
       2. Reed    : UK-specific, server-rendered
       3. Totaljobs: UK-specific, server-rendered
       4. Gradcracker: UK STEM students / spring weeks
+
+    If job_desc and company_name are already set (manual mode), passes through unchanged.
     """
+    # Manual mode — job was provided by the user, skip all scraping
+    if state.get("job_desc") and state.get("company_name"):
+        print(f"Manual job: {state['job_desc'].split(chr(10))[0][:60]}")
+        return {}
 
     # ── 1. Trackr (structured UK early-careers API) ──────────────────────────
     result = _scrape_trackr()
@@ -734,6 +788,13 @@ async def check_history(state: AppState):
     ).fetchone()
     if dup:
         print(f"Duplicate (company+role within 30 days, id={dup[0]}). Skipping.")
+        conn.close()
+        return {"is_duplicate": True, "historical_context": ""}
+
+    # Check if the job URL is still live and accepting applications
+    is_open, reason = _check_url_open(job_url)
+    if not is_open:
+        print(f"Job appears closed ({reason}). Skipping.")
         conn.close()
         return {"is_duplicate": True, "historical_context": ""}
 
@@ -1111,7 +1172,43 @@ def send_telegram_notification(company: str, program: str, pdf_path: str, job_ur
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
+def _collect_manual_job() -> dict:
+    """Interactive prompt to collect a job description from the user."""
+    print("\n" + "="*60)
+    print("  MANUAL JOB APPLICATION")
+    print("="*60)
+    company  = input("Company name: ").strip()
+    role     = input("Job title   : ").strip()
+    url      = input("Job URL (Enter to skip): ").strip()
+    prog     = input("Program type [summer internship]: ").strip() or "summer internship"
+
+    print("\nPaste the full job description below.")
+    print("Type END on its own line when done:\n")
+    lines = []
+    while True:
+        line = input()
+        if line.strip().upper() == "END":
+            break
+        lines.append(line)
+
+    job_desc = f"Role: {role}\nCompany: {company}\n\n" + "\n".join(lines)
+    print(f"\nJob captured: {len(job_desc)} chars.")
+    return {
+        "job_desc":     job_desc,
+        "company_name": company,
+        "job_url":      url,
+        "program_type": prog,
+    }
+
+
 async def main():
+    parser = argparse.ArgumentParser(description="Job Drop Agent")
+    parser.add_argument(
+        "--manual", action="store_true",
+        help="Manually provide a job description instead of scraping"
+    )
+    args = parser.parse_args()
+
     base_state = {
         "loops":              0,
         "feedback":           [],
@@ -1137,44 +1234,70 @@ async def main():
         "pdf_path":           "",
     }
 
-    print("Prefetching Trackr (UK engineering roles, pre-scored)...")
-    prefetch_trackr()
+    if args.manual:
+        # ── Manual mode ───────────────────────────────────────────────────────
+        manual_job = _collect_manual_job()
+        base_state.update(manual_job)
 
-    print("Prefetching jobs from LinkedIn, Indeed, Glassdoor...")
-    await prefetch_jobspy()
-
-    generated = 0
-    for attempt in range(1, 9):
-        print(f"\n--- Attempt {attempt}/8 ---")
-
+        print("\nRunning pipeline on manual job...")
         vals = await app.ainvoke(dict(base_state))
 
-        if vals.get("is_duplicate"):
-            continue
         if not vals.get("triage_passed"):
-            print(f"Triage failed ({vals.get('triage_score', 0):.2f}). Trying next job...")
-            continue
+            score = vals.get("triage_score", 0)
+            print(f"\nTriage failed ({score:.2f}) — this job doesn't match your portfolio well enough.")
+            print("You can still apply manually, but the CV wouldn't be strongly tailored.")
+        else:
+            pdf     = vals.get("pdf_path", "")
+            company = vals.get("company_name", "")
+            job_url = vals.get("job_url", "")
+            program = vals.get("program_type", "")
+            print(f"\n{'='*60}")
+            print(f"  CV READY: {os.path.abspath(pdf) if pdf else 'compilation failed'}")
+            print(f"  Company : {company}")
+            print(f"  Program : {program}")
+            print(f"  Apply   : {job_url or 'check cv_outputs/ folder'}")
+            print(f"{'='*60}\n")
+            send_telegram_notification(company, program, pdf, job_url)
 
-        pdf     = vals.get("pdf_path", "")
-        company = vals.get("company_name", "")
-        job_url = vals.get("job_url", "")
-        program = vals.get("program_type", "")
-        generated += 1
-
-        print(f"\n{'='*60}")
-        print(f"  CV READY [{generated}]: {os.path.abspath(pdf) if pdf else 'compilation failed'}")
-        print(f"  Company : {company}")
-        print(f"  Program : {program}")
-        print(f"  Apply   : {job_url or 'check cv_outputs/ folder'}")
-        print(f"{'='*60}\n")
-
-        send_telegram_notification(company, program, pdf, job_url)
-        # Continue — don't stop at 1, keep generating for all 8 attempts
-
-    if generated == 0:
-        print("No suitable job found after 8 attempts. Try running again later.")
     else:
-        print(f"\nDone. {generated} CV(s) generated in cv_outputs/. Apply manually.")
+        # ── Auto mode ─────────────────────────────────────────────────────────
+        print("Prefetching Trackr (UK engineering roles, pre-scored)...")
+        prefetch_trackr()
+
+        print("Prefetching jobs from LinkedIn, Indeed, Glassdoor...")
+        await prefetch_jobspy()
+
+        generated = 0
+        for attempt in range(1, 9):
+            print(f"\n--- Attempt {attempt}/8 ---")
+
+            vals = await app.ainvoke(dict(base_state))
+
+            if vals.get("is_duplicate"):
+                continue
+            if not vals.get("triage_passed"):
+                print(f"Triage failed ({vals.get('triage_score', 0):.2f}). Trying next job...")
+                continue
+
+            pdf     = vals.get("pdf_path", "")
+            company = vals.get("company_name", "")
+            job_url = vals.get("job_url", "")
+            program = vals.get("program_type", "")
+            generated += 1
+
+            print(f"\n{'='*60}")
+            print(f"  CV READY [{generated}]: {os.path.abspath(pdf) if pdf else 'compilation failed'}")
+            print(f"  Company : {company}")
+            print(f"  Program : {program}")
+            print(f"  Apply   : {job_url or 'check cv_outputs/ folder'}")
+            print(f"{'='*60}\n")
+
+            send_telegram_notification(company, program, pdf, job_url)
+
+        if generated == 0:
+            print("No suitable job found after 8 attempts. Try running again later.")
+        else:
+            print(f"\nDone. {generated} CV(s) generated in cv_outputs/. Apply manually.")
 
 if __name__ == "__main__":
     asyncio.run(main())
