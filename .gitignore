@@ -1,3 +1,6 @@
 .env
 venv
 bedrock-long-term-api-key.csv
+applications.db
+cv_outputs/
+jobs_cache.json
