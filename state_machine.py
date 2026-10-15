@@ -166,6 +166,7 @@ class AppState(TypedDict):
     retrieved_projects: str
     static_bio: str
     pdf_path: str
+    cover_letter_path: str
 
 # ── LLM ───────────────────────────────────────────────────────────────────────
 
@@ -229,12 +230,13 @@ def init_db():
     """)
     # Migrate older tables missing new columns
     for col, typedef in [
-        ("program_type",     "TEXT DEFAULT 'internship'"),
-        ("skills_required",  "TEXT"),
-        ("interview_status", "TEXT DEFAULT 'none'"),
-        ("interview_date",   "TEXT"),
-        ("outcome",          "TEXT"),
-        ("notes",            "TEXT"),
+        ("program_type",       "TEXT DEFAULT 'internship'"),
+        ("skills_required",    "TEXT"),
+        ("interview_status",   "TEXT DEFAULT 'none'"),
+        ("interview_date",     "TEXT"),
+        ("outcome",            "TEXT"),
+        ("notes",              "TEXT"),
+        ("cover_letter_path",  "TEXT"),
     ]:
         try:
             conn.execute(f"ALTER TABLE applications ADD COLUMN {col} {typedef}")
@@ -889,14 +891,14 @@ async def triage_job(state: AppState):
     top2   = np.argsort(scores)[-2:][::-1]
     best   = float(scores[top2[0]])
 
-    if best >= 0.32:
+    if best >= 0.25:
         retrieved = "\n\n".join(
             f"PROJECT — {projects[i]}:\n{enriched_descriptions[i]}" for i in top2
         )
         print(f"Triage passed ({best:.2f}). Projects: {[projects[i] for i in top2]}")
         return {"triage_passed": True,  "retrieved_projects": retrieved, "triage_score": best}
 
-    print(f"Triage failed ({best:.2f} < 0.32).")
+    print(f"Triage failed ({best:.2f} < 0.25).")
     return {"triage_passed": False, "retrieved_projects": "", "triage_score": best}
 
 
@@ -1027,7 +1029,7 @@ Rules:
 
 
 async def compile_pdf(state: AppState):
-    print("\n>>> COMPILING APPLICATION PDF... <<<")
+    print("\n>>> COMPILING APPLICATION PDFs... <<<")
     os.makedirs(CV_OUTPUT_DIR, exist_ok=True)
 
     cv_text  = strip_emojis(state.get("cv_draft", ""))
@@ -1045,35 +1047,36 @@ async def compile_pdf(state: AppState):
         hr    { display: none; }
         table { border-collapse: collapse; width: 100%; margin-bottom: 8px; }
         td, th { padding: 3px 8px; border: 1px solid #ccc; font-size: 10.5pt; }
-        .page-break { page-break-before: always; }
     </style>
     """
 
-    cv_html  = markdown.markdown(cv_text, extensions=["tables"])
-    cl_html  = markdown.markdown(cl_text, extensions=["tables"])
-    full_html = (
-        f"<html><head><meta charset='utf-8'>{css}</head><body>"
-        f"{cv_html}"
-        f'<div class="page-break"></div>'
-        f"{cl_html}"
-        f"</body></html>"
-    )
-
-    output_filename = os.path.join(CV_OUTPUT_DIR, f"{slug}_{date_str}.pdf")
     options = {
         "page-size": "A4", "margin-top": "0", "margin-right": "0",
         "margin-bottom": "0", "margin-left": "0",
         "encoding": "UTF-8", "disable-smart-shrinking": "",
     }
 
-    try:
-        pdfkit.from_string(full_html, output_filename, options=options)
-        print(f">>> PDF COMPILED: {os.path.abspath(output_filename)} <<<")
-    except Exception as e:
-        print(f">>> PDF COMPILATION FAILED: {e} <<<")
-        output_filename = ""
+    def _make_html(body_html: str) -> str:
+        return f"<html><head><meta charset='utf-8'>{css}</head><body>{body_html}</body></html>"
 
-    return {"pdf_path": output_filename}
+    cv_file = os.path.join(CV_OUTPUT_DIR, f"{slug}_{date_str}_cv.pdf")
+    cl_file = os.path.join(CV_OUTPUT_DIR, f"{slug}_{date_str}_coverletter.pdf")
+
+    try:
+        pdfkit.from_string(_make_html(markdown.markdown(cv_text, extensions=["tables"])), cv_file, options=options)
+        print(f">>> CV PDF:           {os.path.abspath(cv_file)} <<<")
+    except Exception as e:
+        print(f">>> CV PDF FAILED: {e} <<<")
+        cv_file = ""
+
+    try:
+        pdfkit.from_string(_make_html(markdown.markdown(cl_text, extensions=["tables"])), cl_file, options=options)
+        print(f">>> Cover letter PDF: {os.path.abspath(cl_file)} <<<")
+    except Exception as e:
+        print(f">>> COVER LETTER PDF FAILED: {e} <<<")
+        cl_file = ""
+
+    return {"pdf_path": cv_file, "cover_letter_path": cl_file}
 
 
 async def log_application(state: AppState):
@@ -1085,8 +1088,8 @@ async def log_application(state: AppState):
     conn = sqlite3.connect(DB_PATH)
     conn.execute(
         """INSERT INTO applications
-           (applied_at, company, role, program_type, job_url, triage_score, skills_required, pdf_path, status)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+           (applied_at, company, role, program_type, job_url, triage_score, skills_required, pdf_path, cover_letter_path, status)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
         (
             datetime.now().isoformat(),
             state.get("company_name", ""),
@@ -1096,6 +1099,7 @@ async def log_application(state: AppState):
             state.get("triage_score", 0.0),
             state.get("skills_required", ""),
             state.get("pdf_path", ""),
+            state.get("cover_letter_path", ""),
             "applied",
         ),
     )
@@ -1139,8 +1143,8 @@ app = workflow.compile()
 
 # ── Telegram ──────────────────────────────────────────────────────────────────
 
-def send_telegram_notification(company: str, program: str, pdf_path: str, job_url: str):
-    """Notify that a CV is ready in cv_outputs/ — no approval needed, just a heads-up."""
+def send_telegram_notification(company: str, program: str, pdf_path: str, cover_letter_path: str, job_url: str):
+    """Notify that CV and cover letter are ready in cv_outputs/ — no approval needed, just a heads-up."""
     bot_token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id   = os.getenv("TELEGRAM_CHAT_ID")
 
@@ -1150,12 +1154,13 @@ def send_telegram_notification(company: str, program: str, pdf_path: str, job_ur
 
     # HTML parse mode — avoids _ and & in URLs breaking Telegram's Markdown parser
     message = (
-        "\U0001f916 <b>JOB DROP — CV Ready</b>\n\n"
+        "\U0001f916 <b>JOB DROP — Documents Ready</b>\n\n"
         f"<b>Company:</b> {company}\n"
         f"<b>Program:</b> {program}\n"
-        f"<b>File:</b> <code>{os.path.basename(pdf_path)}</code>\n\n"
+        f"<b>CV:</b> <code>{os.path.basename(pdf_path) if pdf_path else 'failed'}</code>\n"
+        f"<b>Cover Letter:</b> <code>{os.path.basename(cover_letter_path) if cover_letter_path else 'failed'}</code>\n\n"
         f"Apply at: {job_url or 'check cv_outputs/ folder'}\n\n"
-        "<i>CV and cover letter saved. Apply manually when ready.</i>"
+        "<i>CV and cover letter saved as separate files. Apply manually when ready.</i>"
     )
 
     try:
@@ -1216,7 +1221,7 @@ async def main():
             "Name: Aryan Naik | Email: aryannaik1205@gmail.com | "
             "GitHub: github.com/RobotsAndAryan | "
             "Education: 2nd-year MEng Robotics and Artificial Intelligence at "
-            "University College London (UCL) | Graduation: 2029."
+            "University College London (UCL) | Start: 2025 | Graduation: 2029."
         ),
         "job_desc":           "",
         "job_url":            "",
@@ -1232,6 +1237,7 @@ async def main():
         "triage_score":       0.0,
         "retrieved_projects": "",
         "pdf_path":           "",
+        "cover_letter_path":  "",
     }
 
     if args.manual:
@@ -1248,16 +1254,18 @@ async def main():
             print("You can still apply manually, but the CV wouldn't be strongly tailored.")
         else:
             pdf     = vals.get("pdf_path", "")
+            cl      = vals.get("cover_letter_path", "")
             company = vals.get("company_name", "")
             job_url = vals.get("job_url", "")
             program = vals.get("program_type", "")
             print(f"\n{'='*60}")
-            print(f"  CV READY: {os.path.abspath(pdf) if pdf else 'compilation failed'}")
+            print(f"  CV:           {os.path.abspath(pdf) if pdf else 'compilation failed'}")
+            print(f"  Cover Letter: {os.path.abspath(cl) if cl else 'compilation failed'}")
             print(f"  Company : {company}")
             print(f"  Program : {program}")
             print(f"  Apply   : {job_url or 'check cv_outputs/ folder'}")
             print(f"{'='*60}\n")
-            send_telegram_notification(company, program, pdf, job_url)
+            send_telegram_notification(company, program, pdf, cl, job_url)
 
     else:
         # ── Auto mode ─────────────────────────────────────────────────────────
@@ -1280,19 +1288,21 @@ async def main():
                 continue
 
             pdf     = vals.get("pdf_path", "")
+            cl      = vals.get("cover_letter_path", "")
             company = vals.get("company_name", "")
             job_url = vals.get("job_url", "")
             program = vals.get("program_type", "")
             generated += 1
 
             print(f"\n{'='*60}")
-            print(f"  CV READY [{generated}]: {os.path.abspath(pdf) if pdf else 'compilation failed'}")
+            print(f"  CV [{generated}]:        {os.path.abspath(pdf) if pdf else 'compilation failed'}")
+            print(f"  Cover Letter [{generated}]: {os.path.abspath(cl) if cl else 'compilation failed'}")
             print(f"  Company : {company}")
             print(f"  Program : {program}")
             print(f"  Apply   : {job_url or 'check cv_outputs/ folder'}")
             print(f"{'='*60}\n")
 
-            send_telegram_notification(company, program, pdf, job_url)
+            send_telegram_notification(company, program, pdf, cl, job_url)
 
         if generated == 0:
             print("No suitable job found after 8 attempts. Try running again later.")
